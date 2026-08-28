@@ -149,6 +149,75 @@ class _TraceableWrapper(torch.Tensor):
         return _TraceableWrapper(inner_tensors["elem"])
 
 
+class _DetachedInnerWrapper(torch.Tensor):
+    elem: torch.Tensor
+
+    __slots__ = ["elem"]
+
+    @staticmethod
+    def __new__(cls, elem):
+        wrapper = torch.Tensor._make_wrapper_subclass(
+            cls,
+            elem.size(),
+            dtype=elem.dtype,
+            layout=elem.layout,
+            device=elem.device,
+            requires_grad=elem.requires_grad,
+            strides=elem.stride(),
+            storage_offset=elem.storage_offset(),
+        )
+        wrapper.elem = elem
+        return wrapper
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        def unwrap(value):
+            return value.elem if isinstance(value, _DetachedInnerWrapper) else value
+
+        args = torch.utils._pytree.tree_map(unwrap, args)
+        kwargs = torch.utils._pytree.tree_map(unwrap, kwargs or {})
+        result = func(*args, **kwargs)
+        if func == torch.ops.aten.detach.default:
+            return _DetachedInnerWrapper(result)
+        return result
+
+    def __tensor_flatten__(self):
+        return ["elem"], None
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, metadata, outer_size, outer_stride):
+        return _DetachedInnerWrapper(inner_tensors["elem"])
+
+
+class _WrapperWeightModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        wrapped = _DetachedInnerWrapper(torch.randn(4, 4))
+        self.weight = nn.Parameter(wrapped)
+
+    def forward(self, x):
+        return x @ self.weight
+
+
+class TestMinimalFXTracerTensorSubclass(unittest.TestCase):
+    def test_trainable_wrapper_with_detached_inner(self):
+        model = _WrapperWeightModule()
+        self.assertTrue(model.weight.requires_grad)
+        self.assertFalse(model.weight.elem.requires_grad)
+        x = torch.randn(2, 4)
+
+        def train_step(inputs):
+            loss = model(inputs).square().sum()
+            (grad,) = torch.autograd.grad(loss, (model.weight,))
+            return loss, grad
+
+        expected = train_step(x)
+        traced = minimal_fx_tracer(train_step, module=model)(x)
+        actual = run_traced(traced, module=model)(x)
+
+        torch.testing.assert_close(actual, expected)
+
+
 class TestMinimalFXTracerDynamicShapes(unittest.TestCase):
     def _trace_mark_dynamic_value_range(self, *, min_value=None, max_value=None):
         from torch._dynamo import mark_dynamic

@@ -340,6 +340,10 @@ def main():
             f"got '{mode}'."
         )
 
+    from torchtitan.experiments.graph_trainer.configs import validate_fp8_graph_config
+
+    validate_fp8_graph_config(config.compile)
+
     (
         model,
         model_config,

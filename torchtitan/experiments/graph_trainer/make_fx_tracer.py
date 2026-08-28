@@ -430,16 +430,37 @@ def minimal_fx_tracer(
                     "supported"
                 )
         unwrapped_args, input_layouts = _unwrap_subclasses(full_args)
+        subclass_inner_requires_grad: set[int] = set()
+        flat_index = 0
+        for arg_index, arg in enumerate(full_args):
+            layout = input_layouts.get(arg_index)
+            num_tensors = layout.num_tensors if layout is not None else 1
+            if layout is not None and arg.requires_grad:
+                subclass_inner_requires_grad.update(
+                    range(flat_index, flat_index + num_tensors)
+                )
+            flat_index += num_tensors
+
         fake_mode = FakeTensorMode(
             allow_non_fake_inputs=True,
             shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
         )
-        fake_args = tuple(
-            _fakeify_input(fake_mode, a, input_name=f"input_{i}")
-            if isinstance(a, torch.Tensor)
-            else a
-            for i, a in enumerate(unwrapped_args)
-        )
+        fake_args_list = []
+        for i, arg in enumerate(unwrapped_args):
+            if not isinstance(arg, torch.Tensor):
+                fake_args_list.append(arg)
+                continue
+            fake_arg = _fakeify_input(fake_mode, arg, input_name=f"input_{i}")
+            # Some trainable wrapper subclasses keep requires_grad only on the
+            # outer tensor while their flattened data tensor is detached. The
+            # graph consumes the flattened inputs, so restore that autograd
+            # contract before reconstructing the wrapper for tracing.
+            if i in subclass_inner_requires_grad and (
+                fake_arg.is_floating_point() or fake_arg.is_complex()
+            ):
+                fake_arg.requires_grad_(True)
+            fake_args_list.append(fake_arg)
+        fake_args = tuple(fake_args_list)
 
         output_layouts: dict[int, SubclassLayout] = {}
         num_flat_outputs: int = 0

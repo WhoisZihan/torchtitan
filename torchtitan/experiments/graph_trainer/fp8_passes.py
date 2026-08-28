@@ -23,17 +23,14 @@ from torchtitan.tools.logging import logger
 _FP8_META = "fp8"
 
 
-def _available_scaled_mm_targets() -> frozenset[object]:
-    targets = []
-    for op_name in ("_scaled_mm", "_scaled_grouped_mm"):
-        op = getattr(torch.ops.aten, op_name, None)
-        target = getattr(op, "default", None)
-        if target is not None:
-            targets.append(target)
-    return frozenset(targets)
+def _available_aten_targets(op_name: str) -> frozenset[object]:
+    op = getattr(torch.ops.aten, op_name, None)
+    target = getattr(op, "default", None)
+    return frozenset((target,)) if target is not None else frozenset()
 
 
-_SCALED_MM_TARGETS = _available_scaled_mm_targets()
+_SCALED_MM_TARGETS = _available_aten_targets("_scaled_mm")
+_SCALED_GROUPED_MM_TARGETS = _available_aten_targets("_scaled_grouped_mm")
 _FP8_DATA_DTYPES = frozenset(
     dtype
     for dtype in (
@@ -51,8 +48,8 @@ _FP8_DATA_DTYPES = frozenset(
 FP8_COMPUTE_TARGETS: dict[str, frozenset[object]] = {
     "float8_linear": _SCALED_MM_TARGETS,
     "mxfp8_linear": _SCALED_MM_TARGETS,
-    "float8_grouped_experts": _SCALED_MM_TARGETS,
-    "mxfp8_grouped_experts": _SCALED_MM_TARGETS,
+    "float8_grouped_experts": _SCALED_GROUPED_MM_TARGETS,
+    "mxfp8_grouped_experts": _SCALED_GROUPED_MM_TARGETS,
 }
 
 
@@ -189,10 +186,60 @@ def _is_regional_fp8_compute_node(
     return isinstance(value, torch.Tensor) and value.device.type == "cuda"
 
 
+def _iter_tensors(value: object):
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_tensors(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_tensors(item)
+
+
+def _sympy_expr(dim: object):
+    if isinstance(dim, torch.SymInt):
+        return dim.node.expr
+    return None
+
+
+def _region_has_unbound_input_size_symbols(nodes: list[torch.fx.Node]) -> bool:
+    """Return True if regional Inductor would see orphaned input size symbols.
+
+    Inductor requires every free symbol in a compound input size/stride
+    expression to also appear as a simple size/stride of some region input.
+    EP-padded MoE tensors often have sizes like ``round_up(u2 + u3 + C, 16)``
+    where ``u2``/``u3`` never appear alone on the extracted region's inputs,
+    which raises:
+    ``expected [u2, u3] to have been codegen-ed``.
+    """
+    import sympy
+
+    region = set(nodes)
+    bound_symbols: set[object] = set()
+    compound_exprs: list[object] = []
+
+    for node in nodes:
+        for inp in node.all_input_nodes:
+            if inp in region:
+                continue
+            for tensor in _iter_tensors(inp.meta.get("val")):
+                for dim in (*tensor.shape, *tensor.stride()):
+                    expr = _sympy_expr(dim)
+                    if expr is None:
+                        continue
+                    if isinstance(expr, sympy.Symbol):
+                        bound_symbols.add(expr)
+                    elif isinstance(expr, sympy.Expr) and expr.free_symbols:
+                        compound_exprs.append(expr)
+
+    return any(expr.free_symbols - bound_symbols for expr in compound_exprs)
+
+
 def _identify_fp8_regional_components(
     gm: torch.fx.GraphModule,
 ) -> torch.fx.GraphModule:
-    """Identify maximal dense FP8 compute components for regional Inductor.
+    """Identify maximal FP8 compute components for regional Inductor.
 
     Each component is seeded by a supported FP8 compute operation and expands
     only through CUDA aten nodes with the same module and quantization
@@ -200,7 +247,6 @@ def _identify_fp8_regional_components(
     GraphPP passes shared grad-output quantization from bw_di to bw_dw; they
     prove the compute operand dtype but are not compiled as part of the local
     region. Communication and host work remain outside these regions.
-    Grouped-expert FP8 is not supported by regional Inductor compilation.
     """
     candidate_nodes: set[torch.fx.Node] = set()
     seeds: list[torch.fx.Node] = []
@@ -214,11 +260,6 @@ def _identify_fp8_regional_components(
         module_fqn = custom.get(_MODULE_FQN, "")
         if quantization_kind is None:
             continue
-        if quantization_kind.endswith("grouped_experts"):
-            raise ValueError(
-                "FP8 regional compilation does not support grouped experts. "
-                "Use full Inductor for grouped-expert FP8 graphs."
-            )
         if _is_regional_fp8_compute_node(
             node,
             module_fqn=module_fqn,
@@ -315,6 +356,7 @@ def annotate_complete_fp8_regions_for_regional_inductor_pass(
 
     num_tagged_nodes = 0
     incomplete_regions: list[tuple[str, str, int]] = []
+    unbound_symbol_regions: list[tuple[str, str, int]] = []
     for region_key, nodes in regions.items():
         if len(nodes) != expected_num_nodes[region_key]:
             incomplete_regions.append(region_key)
@@ -323,6 +365,9 @@ def annotate_complete_fp8_regions_for_regional_inductor_pass(
             node.meta["custom"][_FP8_META].get("op_role") == "compute"
             for node in nodes
         ):
+            continue
+        if _region_has_unbound_input_size_symbols(nodes):
+            unbound_symbol_regions.append(region_key)
             continue
         _, _, region_id = region_key
         for node in nodes:
@@ -337,8 +382,14 @@ def annotate_complete_fp8_regions_for_regional_inductor_pass(
             f"{incomplete_regions}. The affected nodes will run eagerly.",
             stacklevel=2,
         )
+    if unbound_symbol_regions:
+        warnings.warn(
+            "GraphTrainer skipped FP8 regional Inductor regions with unbound "
+            f"input size symbols: {unbound_symbol_regions}. The affected "
+            "nodes will run eagerly.",
+            stacklevel=2,
+        )
     if num_tagged_nodes:
-        gm.meta["fp8_regional_tagged_complete_nodes"] = num_tagged_nodes
         logger.info(
             "Tagged %d complete FP8 regional Inductor nodes",
             num_tagged_nodes,
@@ -367,7 +418,7 @@ def annotate_fp8_regions_for_regional_inductor_pass(
     *,
     strict: bool,
 ) -> torch.fx.GraphModule:
-    """Validate FP8 lowering and identify dense regions for regional Inductor."""
+    """Validate FP8 lowering and identify regions for regional Inductor."""
     del example_inputs
     gm = _inspect_fp8_regions(
         gm,
