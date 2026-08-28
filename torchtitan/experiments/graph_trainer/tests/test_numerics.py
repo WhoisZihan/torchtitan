@@ -100,7 +100,7 @@ def run_loss_compare_close(
     AutoParallel can choose a different SPMD graph and collective ordering than
     eager, so this checks tight numerical agreement rather than bitwise identity.
     """
-    from scripts.loss_compare import extract_losses_from_tensorboard
+    from scripts.loss_compare import extract_metrics_from_tensorboard
 
     with tempfile.TemporaryDirectory() as job_dump_folder:
         cmd = [
@@ -128,10 +128,12 @@ def run_loss_compare_close(
             print("loss_compare.py failed")
             return False
 
-        baseline_losses = extract_losses_from_tensorboard(
-            job_dump_folder, "tb_baseline"
-        )
-        test_losses = extract_losses_from_tensorboard(job_dump_folder, "tb_test")
+        baseline_losses = extract_metrics_from_tensorboard(
+            job_dump_folder, "tb_baseline", ["loss"]
+        )["loss"]
+        test_losses = extract_metrics_from_tensorboard(
+            job_dump_folder, "tb_test", ["loss"]
+        )["loss"]
         if baseline_losses.keys() != test_losses.keys():
             return False
         max_step = max(
@@ -195,7 +197,7 @@ def _extract_losses_from_rank_tensorboard(
     tb_folder: str,
     rank: int,
 ) -> dict[int, float]:
-    from scripts.loss_compare import TB_LOSS_TAG
+    from scripts.loss_compare import TB_TAGS
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
     base_path = os.path.join(job_dump_folder, tb_folder)
@@ -218,7 +220,8 @@ def _extract_losses_from_rank_tensorboard(
     event_accumulator = EventAccumulator(rank_event_dirs[0])
     event_accumulator.Reload()
     losses = {
-        scalar.step: scalar.value for scalar in event_accumulator.Scalars(TB_LOSS_TAG)
+        scalar.step: scalar.value
+        for scalar in event_accumulator.Scalars(TB_TAGS["loss"])
     }
     print(f"Extracted {len(losses)} losses from {rank_event_dirs[0]}")
     return losses
@@ -302,6 +305,12 @@ DSV3_EP_OVERLAP_GRAPH = " --compile.ep_overlap.strategy graph"
 DSV3_EP_OVERLAP_GRAPH_BITWISE = (
     DSV3_EP_OVERLAP_GRAPH + " --compile.ep_overlap.disable_early_grad_accumulation"
 )
+DSV3_FP8_GROUPED_EXPERTS_PARALLELISM = (
+    "--training.disable_cuda_graphs"
+    " --parallelism.data_parallel_shard_degree=2"
+    " --parallelism.tensor_parallel_degree=1"
+    " --parallelism.expert_parallel_degree=2"
+)
 
 
 def _run_deepseek_v3_loss_compare(
@@ -327,6 +336,27 @@ def _run_deepseek_v3_loss_compare(
         test_config=test_config,
         baseline_options=baseline_options,
         test_options=test_options,
+    )
+
+
+def _run_deepseek_v3_fp8_grouped_experts_loss_compare() -> bool:
+    """Compare Trainer and regional GraphTrainer Float8 grouped experts.
+
+    Regional Inductor compiles FP8 grouped-expert regions (especially with
+    ``TORCHTITAN_FP8_EP_UNBACKED_PAD=1``), so losses can differ slightly from
+    eager Trainer. Match the dense full-Inductor FP8 tolerance rather than
+    requiring bitwise identity.
+    """
+    return run_loss_compare_close(
+        baseline_module="deepseek_v3",
+        baseline_config="deepseek_v3_debugmodel_float8",
+        test_module="graph_trainer.deepseek_v3",
+        test_config="graph_trainer_deepseek_v3_debugmodel_float8",
+        baseline_options=DSV3_FP8_GROUPED_EXPERTS_PARALLELISM,
+        test_options=DSV3_FP8_GROUPED_EXPERTS_PARALLELISM,
+        baseline_ngpus=2,
+        test_ngpus=2,
+        rtol=1e-4,
     )
 
 
@@ -676,7 +706,12 @@ class TestGraphTrainerNumerics(unittest.TestCase):
     "FP8 numerics tests require TorchAO and an H100-class GPU",
 )
 class TestGraphTrainerFP8Numerics(unittest.TestCase):
-    """H100-only dense FP8 loss equivalence against the Trainer path."""
+    """Hopper FP8 loss agreement against the Trainer path.
+
+    Dense regional may still be bitwise; full Inductor and EP grouped-expert
+    regional use a tight numerical tolerance because Inductor FP8 kernels are
+    not required to match eager bit-for-bit.
+    """
 
     def test_dense_llama3_fp8_full_cudagraph_vs_trainer(self):
         self.assertTrue(
@@ -692,6 +727,9 @@ class TestGraphTrainerFP8Numerics(unittest.TestCase):
                 "graph_trainer_llama3_debugmodel_float8_regional",
             )
         )
+
+    def test_deepseek_v3_fp8_grouped_experts_regional_vs_trainer(self):
+        self.assertTrue(_run_deepseek_v3_fp8_grouped_experts_loss_compare())
 
 
 @unittest.skipUnless(

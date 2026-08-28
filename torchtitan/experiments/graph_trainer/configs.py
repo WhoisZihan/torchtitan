@@ -208,13 +208,57 @@ def validate_fp8_graph_config(compile_config: GraphTrainerCompileConfig) -> None
             "--compile.fp8.enabled requires --compile.inductor_compilation full "
             "or regional"
         )
-    if (
-        compile_config.precompile_artifact_dir
-        and compile_config.inductor_compilation != "regional"
-    ):
+    if compile_config.precompile_artifact_dir:
         raise ValueError(
-            "FP8 precompile requires --compile.inductor_compilation regional"
+            "GraphTrainer FP8 is incompatible with --compile.precompile_artifact_dir. "
+            "CooR precompile tracing fails on torchao FP8 layout guards and "
+            "FlexAttention BlockMask serialization. Use online "
+            "--compile.mode aot_fx_trace without precompile, or a non-FP8 "
+            "config for CooR precompile."
         )
+
+
+_FP8_QUANTIZATION_KINDS = frozenset(
+    {
+        "float8_linear",
+        "mxfp8_linear",
+        "float8_grouped_experts",
+        "mxfp8_grouped_experts",
+    }
+)
+
+
+def validate_fp8_quantization_precompile(
+    model,
+    compile_config: GraphTrainerCompileConfig,
+) -> None:
+    """Reject FP8/MXFP8 models with GraphTrainer CooR precompile.
+
+    Quantized modules may be present even when ``--compile.fp8.enabled`` is off.
+    CooR FakeTensor tracing still hits torchao FP8 layout guards (especially
+    grouped GEMM backward) and FlexAttention masks are not precompile-safe.
+    """
+    if not compile_config.precompile_artifact_dir:
+        return
+
+    from torchtitan.components.quantization.utils import get_quantization_signature
+
+    fp8_kinds = sorted(
+        {
+            signature.kind
+            for signature in get_quantization_signature(model)
+            if signature.kind in _FP8_QUANTIZATION_KINDS
+        }
+    )
+    if not fp8_kinds:
+        return
+
+    raise ValueError(
+        "FP8/MXFP8 quantization is incompatible with GraphTrainer precompile "
+        f"(found {fp8_kinds}). Use online --compile.mode aot_fx_trace without "
+        "--compile.precompile_artifact_dir, or a non-FP8 model config for "
+        "CooR precompile."
+    )
 
 
 def validate_autoparallel_config(

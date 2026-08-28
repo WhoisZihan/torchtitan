@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
-from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,7 +15,13 @@ from torch.fx.traceback import preserve_node_meta
 from torch.testing._internal.common_utils import TestCase
 
 from torchtitan.components.quantization import Float8Linear, Float8LinearConverter
-from torchtitan.components.quantization.utils import QuantizationSignature
+from torchtitan.components.quantization.float8 import (
+    _get_float8_grouped_experts_cls,
+)
+from torchtitan.components.quantization.utils import (
+    QuantizationSignature,
+    get_quantization_signature,
+)
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.experiments.graph_trainer.common_utils import (
     _MODULE_FQN,
@@ -37,6 +42,7 @@ from torchtitan.experiments.graph_trainer.configs import (
     FP8GraphConfig,
     GraphTrainerCompileConfig,
     validate_fp8_graph_config,
+    validate_fp8_quantization_precompile,
 )
 from torchtitan.experiments.graph_trainer.fp8_passes import (
     FP8_COMPUTE_TARGETS,
@@ -54,6 +60,7 @@ from torchtitan.experiments.graph_trainer.passes import (
     graph_pp_pre_partition_fp8_passes,
 )
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.tools.utils import has_cuda_capability
 
 
@@ -96,7 +103,7 @@ class TestFP8GraphConfig(TestCase):
         )
         validate_fp8_graph_config(config)
 
-    def test_fp8_precompile_requires_regional_inductor(self) -> None:
+    def test_fp8_precompile_is_rejected(self) -> None:
         config = GraphTrainerCompileConfig(
             enable=True,
             inductor_compilation="full",
@@ -104,10 +111,10 @@ class TestFP8GraphConfig(TestCase):
             precompile_artifact_dir="/tmp/fp8",
             fp8=FP8GraphConfig(enabled=True),
         )
-        with self.assertRaisesRegex(ValueError, "precompile requires"):
+        with self.assertRaisesRegex(ValueError, "incompatible with"):
             validate_fp8_graph_config(config)
 
-    def test_regional_fp8_precompile_is_valid(self) -> None:
+    def test_regional_fp8_precompile_is_rejected(self) -> None:
         config = GraphTrainerCompileConfig(
             enable=True,
             inductor_compilation="regional",
@@ -115,7 +122,70 @@ class TestFP8GraphConfig(TestCase):
             precompile_artifact_dir="/tmp/fp8",
             fp8=FP8GraphConfig(enabled=True),
         )
-        validate_fp8_graph_config(config)
+        with self.assertRaisesRegex(ValueError, "incompatible with"):
+            validate_fp8_graph_config(config)
+
+    def test_float8_linear_precompile_is_rejected(self) -> None:
+        config = GraphTrainerCompileConfig(
+            enable=True,
+            inductor_compilation="regional",
+            precompile_artifact_dir="/tmp/fp8_linear",
+            fp8=FP8GraphConfig(enabled=True),
+        )
+        linear = nn.Linear(2, 2)
+        linear._torchtitan_quantization_recipe_name = "rowwise"
+        model = nn.Module()
+        model.add_module("proj", linear)
+        with patch(
+            "torchtitan.components.quantization.utils.get_quantization_kind",
+            side_effect=lambda module: "float8_linear" if module is linear else None,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "FP8/MXFP8 quantization is incompatible with GraphTrainer precompile"
+            ):
+                validate_fp8_quantization_precompile(model, config)
+
+    def test_grouped_experts_precompile_is_rejected(self) -> None:
+        config = GraphTrainerCompileConfig(
+            enable=True,
+            inductor_compilation="regional",
+            precompile_artifact_dir="/tmp/fp8_grouped",
+            fp8=FP8GraphConfig(enabled=True),
+        )
+        experts = nn.Linear(2, 2)
+        experts._torchtitan_quantization_recipe_name = "rowwise"
+        experts._torchtitan_quantization_pad_multiple = 16
+        model = nn.Module()
+        model.add_module("inner_experts", experts)
+        with patch(
+            "torchtitan.components.quantization.utils.get_quantization_kind",
+            side_effect=lambda module: (
+                "float8_grouped_experts" if module is experts else None
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "FP8/MXFP8 quantization is incompatible with GraphTrainer precompile"
+            ):
+                validate_fp8_quantization_precompile(model, config)
+
+    def test_fp8_quantization_without_precompile_dir_is_allowed(self) -> None:
+        config = GraphTrainerCompileConfig(
+            enable=True,
+            inductor_compilation="regional",
+            fp8=FP8GraphConfig(enabled=True),
+        )
+        experts = nn.Linear(2, 2)
+        experts._torchtitan_quantization_recipe_name = "rowwise"
+        experts._torchtitan_quantization_pad_multiple = 16
+        model = nn.Module()
+        model.add_module("inner_experts", experts)
+        with patch(
+            "torchtitan.components.quantization.utils.get_quantization_kind",
+            side_effect=lambda module: (
+                "float8_grouped_experts" if module is experts else None
+            ),
+        ):
+            validate_fp8_quantization_precompile(model, config)
 
 
 class TestFP8Provenance(TestCase):
@@ -278,6 +348,31 @@ class TestFP8ValidationPass(TestCase):
             {"forward_compute_ops": 1, "backward_compute_ops": 0},
         )
 
+    def test_grouped_compute_requires_scaled_grouped_mm(self) -> None:
+        dense_targets = FP8_COMPUTE_TARGETS["float8_linear"]
+        self.assertTrue(dense_targets)
+
+        for quantization_kind in (
+            "float8_grouped_experts",
+            "mxfp8_grouped_experts",
+        ):
+            grouped_targets = FP8_COMPUTE_TARGETS[quantization_kind]
+            self.assertTrue(grouped_targets)
+            grouped_gm, _ = self._graph_with_quantized_node(
+                next(iter(grouped_targets)),
+                quantization_kind=quantization_kind,
+            )
+            validate_fp8_graph_pass(grouped_gm, strict=True)
+
+            dense_gm, _ = self._graph_with_quantized_node(
+                next(iter(dense_targets)),
+                quantization_kind=quantization_kind,
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "without a supported FP8 compute"
+            ):
+                validate_fp8_graph_pass(dense_gm, strict=True)
+
     def test_fp8_scale_operand_does_not_prove_fp8_compute(self) -> None:
         targets = FP8_COMPUTE_TARGETS["float8_linear"]
         self.assertTrue(targets)
@@ -361,16 +456,44 @@ class TestFP8RegionalAnnotation(TestCase):
         self.assertEqual(cast.meta["custom"]["compile_with_inductor"], expected)
         self.assertEqual(gemm.meta["custom"]["compile_with_inductor"], expected)
 
-    def test_grouped_experts_are_rejected(self) -> None:
-        graph = torch.fx.Graph()
-        x = graph.placeholder("x")
-        node = self._node(graph, torch.ops.aten.relu.default, (x,))
-        node.meta["custom"][_QUANTIZATION_KIND] = "float8_grouped_experts"
-        graph.output(node)
-        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    def test_identifies_and_tags_grouped_experts_component(self) -> None:
+        for quantization_kind in (
+            "float8_grouped_experts",
+            "mxfp8_grouped_experts",
+        ):
+            graph = torch.fx.Graph()
+            x = graph.placeholder("x")
+            cast = self._node(graph, torch.ops.aten.clone.default, (x,))
+            compute = self._node(
+                graph,
+                next(iter(FP8_COMPUTE_TARGETS[quantization_kind])),
+                (cast,),
+            )
+            for node in (cast, compute):
+                node.meta["custom"][_MODULE_FQN] = (
+                    "layers.0.moe.routed_experts.inner_experts"
+                )
+                node.meta["custom"][_QUANTIZATION_KIND] = quantization_kind
+            cast.meta["val"] = torch.empty(
+                1, device="meta", dtype=torch.float8_e4m3fn
+            )
+            compute.meta["custom"]["fp8"]["op_role"] = "compute"
+            graph.output(compute)
+            gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-        with self.assertRaisesRegex(ValueError, "grouped experts"):
-            annotate_fp8_regions_for_regional_inductor_pass(gm, strict=False)
+            with patch(
+                "torchtitan.experiments.graph_trainer.fp8_passes._is_regional_fp8_compute_node",
+                return_value=True,
+            ):
+                annotate_fp8_regions_for_regional_inductor_pass(gm, strict=False)
+            annotate_complete_fp8_regions_for_regional_inductor_pass(gm)
+
+            self.assertEqual(gm.meta["fp8_regional_summary"]["num_regions"], 1)
+            expected = {"inductor_region": 0}
+            self.assertEqual(cast.meta["custom"]["compile_with_inductor"], expected)
+            self.assertEqual(
+                compute.meta["custom"]["compile_with_inductor"], expected
+            )
 
     def test_identifies_fp8_region_without_tagging_inductor(self) -> None:
         graph = torch.fx.Graph()
@@ -446,6 +569,47 @@ class TestFP8RegionalAnnotation(TestCase):
             annotate_complete_fp8_regions_for_regional_inductor_pass(partial_gm)
 
         self.assertNotIn("compile_with_inductor", partial_cast.meta["custom"])
+
+    def test_skips_regions_with_unbound_input_size_symbols(self) -> None:
+        # EP-padded MoE tensors have sizes like round_up(u2 + u3 + C, 16).
+        # When those tensors become regional Inductor inputs without a simple
+        # binding for u2/u3, skip regional compilation (eager fallback).
+        # With TORCHTITAN_FP8_EP_UNBACKED_PAD=1 the pad dim is a fresh unbacked
+        # SymInt instead; this skip path remains the default EP fallback.
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        shape_env = ShapeEnv()
+        with FakeTensorMode(shape_env=shape_env):
+            u2 = shape_env.create_unbacked_symint()
+            u3 = shape_env.create_unbacked_symint()
+            padded = ((u2 + u3 + 79) // 16) * 16
+            padded_val = torch.empty(
+                (padded, 8), device="meta", dtype=torch.float8_e4m3fn
+            )
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = padded_val
+        compute = self._node(
+            graph,
+            next(iter(FP8_COMPUTE_TARGETS["float8_grouped_experts"])),
+            (x,),
+        )
+        compute.meta["custom"]["fp8"].update(
+            {
+                "op_role": "compute",
+                "regional_region_id": 0,
+                "regional_region_num_nodes": 1,
+            }
+        )
+        graph.output(compute)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        with self.assertWarnsRegex(UserWarning, "unbound input size symbols"):
+            annotate_complete_fp8_regions_for_regional_inductor_pass(gm)
+
+        self.assertNotIn("compile_with_inductor", compute.meta["custom"])
 
     def test_reidentifies_partitioned_fp8_regions(self) -> None:
         target = next(iter(FP8_COMPUTE_TARGETS["float8_linear"]))
@@ -537,6 +701,59 @@ class TestFP8RegionalAnnotation(TestCase):
     "FP8 regional compilation requires TorchAO and an H100-class GPU",
 )
 class TestFP8RegionalCompilation(TestCase):
+    def test_float8_grouped_experts_regional_inductor_runs_forward_and_backward(
+        self,
+    ) -> None:
+        torch._inductor.config.emulate_precision_casts = False
+        float8_grouped_experts = _get_float8_grouped_experts_cls(GroupedExperts)
+        model = float8_grouped_experts.Config(
+            dim=16,
+            hidden_dim=16,
+            num_experts=2,
+        ).build()
+        self.assertTrue(torch._inductor.config.emulate_precision_casts)
+        model = model.to(device="cuda", dtype=torch.bfloat16)
+        for parameter in model.parameters():
+            torch.nn.init.normal_(parameter, std=0.02)
+        annotate_module_fqns(nn.Sequential(model))
+        input_tensor = torch.randn(32, 16, device="cuda", dtype=torch.bfloat16)
+        num_tokens_per_expert = torch.tensor(
+            [16, 16], device="cuda", dtype=torch.int64
+        )
+
+        def train_step(
+            x: torch.Tensor, num_tokens: torch.Tensor
+        ) -> list[torch.Tensor]:
+            output = model(x, num_tokens)
+            loss = output.float().sum()
+            grads = torch.autograd.grad(loss, tuple(model.parameters()))
+            return [loss, *grads]
+
+        expected = train_step(input_tensor, num_tokens_per_expert)
+        traced = minimal_fx_tracer(train_step, module=model)(
+            input_tensor, num_tokens_per_expert
+        )
+        self.assertTrue(
+            any(
+                node.target in FP8_COMPUTE_TARGETS["float8_grouped_experts"]
+                for node in traced.gm.graph.nodes
+            )
+        )
+
+        annotate_fp8_regions_for_regional_inductor_pass(traced.gm, strict=True)
+        annotate_complete_fp8_regions_for_regional_inductor_pass(traced.gm)
+        traced.gm = regional_inductor_pass(traced.gm, traced.example_inputs)
+        actual = run_traced(traced, module=model)(
+            input_tensor, num_tokens_per_expert
+        )
+
+        self.assertEqual(len(actual), len(expected))
+        for output_index, (actual_tensor, expected_tensor) in enumerate(
+            zip(actual, expected, strict=True)
+        ):
+            with self.subTest(output_index=output_index):
+                torch.testing.assert_close(actual_tensor, expected_tensor)
+
     def test_float8_linear_converter_regional_inductor_runs_forward_and_backward(
         self,
     ) -> None:
@@ -629,49 +846,35 @@ class TestFP8RegionalCompilation(TestCase):
         self.assertIsNotNone(traced.gm.forward._cudagraph)
 
 
-@dataclass
-class _FingerprintParallelDims:
-    tp: int = 1
+class TestFP8QuantizationSignature(TestCase):
+    def test_grouped_expert_signature_includes_padding_contract(self) -> None:
+        grouped_experts = nn.Linear(2, 2)
+        grouped_experts._torchtitan_quantization_recipe_name = "mxfp8_rceil"
+        grouped_experts._torchtitan_quantization_emulate = False
+        grouped_experts._torchtitan_quantization_pad_multiple = 128
+        model = nn.Module()
+        model.add_module("inner_experts", grouped_experts)
 
-
-class TestFP8PrecompileFingerprint(TestCase):
-    def test_quantization_signature_changes_fingerprint(self) -> None:
-        from torchtitan.experiments.graph_trainer.precompile import (
-            compute_config_fingerprint,
-        )
-
-        config = GraphTrainerCompileConfig(
-            enable=True,
-            inductor_compilation="regional",
-            disable_passes=["cudagraph_pass"],
-            fp8=FP8GraphConfig(enabled=True),
-        )
-        rowwise = QuantizationSignature(
-            module_fqn="layers.0.w1",
-            kind="float8_linear",
-            recipe_name="rowwise",
-            emulate=False,
-        )
-        rowwise_with_gw_hp = QuantizationSignature(
-            module_fqn="layers.0.w1",
-            kind="float8_linear",
-            recipe_name="rowwise_with_gw_hp",
-            emulate=False,
-        )
-        model = torch.nn.Module()
-        dims = _FingerprintParallelDims()
         with patch(
-            "torchtitan.experiments.graph_trainer.precompile.get_quantization_signature",
-            return_value=(rowwise,),
+            "torchtitan.components.quantization.utils.get_quantization_kind",
+            side_effect=lambda module: (
+                "mxfp8_grouped_experts" if module is grouped_experts else None
+            ),
         ):
-            rowwise_fingerprint = compute_config_fingerprint(model, config, dims)
-        with patch(
-            "torchtitan.experiments.graph_trainer.precompile.get_quantization_signature",
-            return_value=(rowwise_with_gw_hp,),
-        ):
-            gw_hp_fingerprint = compute_config_fingerprint(model, config, dims)
+            signatures = get_quantization_signature(model)
 
-        self.assertNotEqual(rowwise_fingerprint, gw_hp_fingerprint)
+        self.assertEqual(
+            signatures,
+            (
+                QuantizationSignature(
+                    module_fqn="inner_experts",
+                    kind="mxfp8_grouped_experts",
+                    recipe_name="mxfp8_rceil",
+                    emulate=False,
+                    pad_multiple=128,
+                ),
+            ),
+        )
 
 
 class TestFP8PassOrdering(TestCase):
@@ -846,3 +1049,89 @@ class TestFP8PassOrdering(TestCase):
         ]
 
         self.assertEqual(pass_names, ["validate_fp8_graph_pass"])
+
+
+class SoftScaledGroupedMMMetaHackTest(TestCase):
+    def test_soft_meta_falls_back_on_data_dependent_layout_guard(self) -> None:
+        import os
+        from unittest import mock
+
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            GuardOnDataDependentSymNode,
+            ShapeEnv,
+        )
+
+        from torchtitan.components.quantization import scaled_grouped_mm_meta_hack as hack
+        from torchtitan.components.quantization.scaled_grouped_mm_meta_hack import (
+            ENV_FLAG,
+            install_soft_scaled_grouped_mm_meta,
+        )
+
+        previous = os.environ.get(ENV_FLAG)
+        os.environ[ENV_FLAG] = "1"
+        # Allow reinstall in this process if a prior test already patched.
+        hack._installed = False
+        hack._orig_meta_grouped_mm_common = None
+        try:
+            self.assertTrue(install_soft_scaled_grouped_mm_meta())
+            shape_env = ShapeEnv()
+            with FakeTensorMode(shape_env=shape_env):
+                u = shape_env.create_unbacked_symint()
+                mat_a = torch.empty((u, 16), device="meta", dtype=torch.float8_e4m3fn)
+                mat_b = torch.empty(
+                    (4, 32, 16), device="meta", dtype=torch.float8_e4m3fn
+                ).transpose(-2, -1)
+                scale_a = torch.empty((u,), device="meta", dtype=torch.float32)
+                scale_b = torch.empty((4, 32), device="meta", dtype=torch.float32)
+                offs = torch.empty((4,), device="meta", dtype=torch.int32)
+
+                def _raise_guard(*_args, **_kwargs):
+                    raise GuardOnDataDependentSymNode(
+                        "Could not guard on data-dependent expression u > 1"
+                    )
+
+                with mock.patch.object(
+                    hack, "_orig_meta_grouped_mm_common", side_effect=_raise_guard
+                ):
+                    out = torch._scaled_grouped_mm(
+                        mat_a,
+                        mat_b,
+                        scale_a,
+                        scale_b,
+                        offs=offs,
+                        out_dtype=torch.bfloat16,
+                    )
+                self.assertEqual(tuple(out.shape), (u, 32))
+        finally:
+            if previous is None:
+                os.environ.pop(ENV_FLAG, None)
+            else:
+                os.environ[ENV_FLAG] = previous
+
+    def test_soft_meta_disabled_by_default(self) -> None:
+        import os
+
+        from torchtitan.components.quantization.scaled_grouped_mm_meta_hack import (
+            ENV_FLAG,
+            ep_unbacked_pad_enabled,
+            install_soft_scaled_grouped_mm_meta,
+        )
+
+        previous = os.environ.get(ENV_FLAG)
+        os.environ.pop(ENV_FLAG, None)
+        try:
+            self.assertFalse(ep_unbacked_pad_enabled())
+            # Already-installed patch from other tests may make this a no-op;
+            # without the env flag a fresh install must not proceed.
+            from torchtitan.components.quantization import scaled_grouped_mm_meta_hack as hack
+
+            was_installed = hack._installed
+            hack._installed = False
+            try:
+                self.assertFalse(install_soft_scaled_grouped_mm_meta())
+            finally:
+                hack._installed = was_installed
+        finally:
+            if previous is not None:
+                os.environ[ENV_FLAG] = previous

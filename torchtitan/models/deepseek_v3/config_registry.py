@@ -109,6 +109,25 @@ def deepseek_v3_debugmodel_mxfp8() -> Trainer.Config:
     return config
 
 
+def deepseek_v3_debugmodel_float8(
+    model_compile_enabled: bool = False,
+) -> Trainer.Config:
+    config = deepseek_v3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            Float8LinearConverter.Config(
+                filter_fqns=["lm_head", "router.gate"],
+                model_compile_enabled=model_compile_enabled,
+            ),
+            Float8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled
+            ),
+        ],
+    )
+    return config
+
+
 def deepseek_v3_debugmodel_hybridep() -> Trainer.Config:
     config = deepseek_v3_debugmodel()
     config.model_spec = model_registry(
@@ -243,28 +262,3 @@ def deepseek_v3_671b() -> Trainer.Config:
         activation_checkpoint=SelectiveAC.Config(),
         compile=CompileConfig(enable=True, components=["loss"]),
     )
-
-
-def deepseek_v3_671b_float8() -> Trainer.Config:
-    config = deepseek_v3_671b()
-    # Quantize the dense Linear layers and the MoE expert grouped GEMMs to
-    # float8 (fp8). This requires torchao and is only supported on NVIDIA SM89+
-    # or AMD MI300+; on other backends (e.g. Intel XPU) the converter raises at
-    # build time, so use the plain deepseek_v3_671b config there.
-    model_compile_enabled = (
-        config.compile.enable and "model" in config.compile.components
-    )
-    config.model_spec = model_registry(
-        "671B",
-        attn_backend="flex",
-        converters=[
-            Float8LinearConverter.Config(
-                filter_fqns=["lm_head", "router.gate"],
-                model_compile_enabled=model_compile_enabled,
-            ),
-            Float8GroupedExpertsConverter.Config(
-                model_compile_enabled=model_compile_enabled
-            ),
-        ],
-    )
-    return config
