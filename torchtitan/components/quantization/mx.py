@@ -121,6 +121,7 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
             recipe_name: str = "mxfp8_rceil"
+            _quantization_pad_multiple: int = 32
 
         def __init__(self, config: Config):
             super().__init__(config)
@@ -131,6 +132,7 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
 
             recipe = MXFP8TrainingRecipe(config.recipe_name)
             self._mxfp8_op_config = MXFP8TrainingOpConfig.from_recipe(recipe)
+            self._quantization_emulate = False
 
         def _grouped_mm(self, *, A, B_t, offs):
             from torchao.prototype.moe_training.utils import (
@@ -192,6 +194,7 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             new_config = config_cls(
                 **{f.name: getattr(config, f.name) for f in fields(config)},
                 recipe_name=self.config.recipe_name,
+                _quantization_pad_multiple=self.config.pad_multiple,
             )
             if parent is None:
                 model_config = new_config

@@ -217,6 +217,7 @@ def validate_fp8_graph_config(compile_config: GraphTrainerCompileConfig) -> None
             "config for CooR precompile."
         )
 
+
 def validate_autoparallel_config(
     compile_config: GraphTrainerCompileConfig,
 ) -> None:

@@ -621,16 +621,22 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
 class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
     """Token dispatcher with token group padding for quantized grouped GEMMs.
 
-    Uses torchao's ``permute_and_pad`` instead of the standard ``_permute`` to
-    reorder tokens into expert-major order and pad each expert's token group to
-    a multiple of ``pad_multiple``. This alignment is required by FP8/MXFP8
-    quantized grouped GEMM kernels (e.g. 16 for FP8, 32 for MXFP8).
+    Uses torchtitan's temporary ``permute_and_pad_unbacked`` (wrapping torchao
+    ``permute_and_pad``) instead of the standard ``_permute`` to reorder tokens
+    into expert-major order and pad each expert's token group to a multiple of
+    ``pad_multiple``. This alignment is required by FP8/MXFP8 quantized grouped
+    GEMM kernels (e.g. 16 for FP8, 32 for MXFP8). Eager uses torchao
+    ``permute_and_pad`` directly; FakeTensor/make_fx uses a custom op. Set
+    ``TORCHTITAN_FP8_EP_UNBACKED_PAD=1`` to mint a fresh unbacked padded length
+    (plus a soft ``_scaled_grouped_mm`` meta fallback). Otherwise FakeTensor
+    keeps algebraic pad sizes and GraphTrainer may skip regional Inductor for
+    unbound compound EP pad expressions.
 
     Works with EP enabled (all-to-all dispatch + padded permute) and with
     EP=1 (``ep_mesh is None``), where it skips the all-to-all and only applies
     the local padded permute. The padding is what the quantized grouped GEMM
     needs; the all-to-all is orthogonal, so EP=1 is supported for single-GPU
-    debugging / numerics by running ``permute_and_pad`` with ``ep_degree=1``.
+    debugging / numerics by running the padded permute with ``ep_degree=1``.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -726,12 +732,14 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         num_global_tokens_per_local_expert_E,
     ):
         # FP8/MXFP8 require groups to be permuted to expert major order AND
-        # padded to nearest multiple of 16.
+        # padded to nearest multiple of pad_multiple.
         # It also does padding to make sure the number of tokens each expert
         # gets locally is a multiple of `self.pad_multiple`.
         # Note that this will create side effects when wrapping the for-loop
         # implementation of GroupedExperts, as it does not need padding.
-        from torchao.prototype.moe_training.ep.permute import permute_and_pad
+        from torchtitan.components.quantization.moe_pad import (
+            permute_and_pad_unbacked,
+        )
 
         # ep_size=1 when EP is disabled: permute_and_pad then only pads token
         # groups (rank-major == expert-major for a single rank).
@@ -744,7 +752,7 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
             permuted_indices,
             num_global_tokens_per_local_expert_padded_e,
             _group_offsets,
-        ) = permute_and_pad(
+        ) = permute_and_pad_unbacked(
             routed_input_RD,
             num_global_tokens_per_local_expert_E,
             ep_size,
