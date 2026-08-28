@@ -195,12 +195,17 @@ def _precompile_aot_fx_trace(
     tokenizer,
 ):
     """aot_fx_trace mode precompilation: make_fx tracing + Inductor."""
+    from torchtitan.experiments.graph_trainer.configs import (
+        validate_fp8_quantization_precompile,
+    )
     from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
     from torchtitan.experiments.graph_trainer.precompile import (
         compute_config_fingerprint,
         precompile_fx_trace_save,
     )
     from torchtitan.experiments.graph_trainer.trainer import make_fwd_bwd_step
+
+    validate_fp8_quantization_precompile(model, compile_config)
 
     loss_fn = config.loss.build(compile_config=compile_config)
     _prepare_loss_for_precompile(model, loss_fn)
@@ -339,6 +344,10 @@ def main():
             f"precompile_main only supports --compile.mode aot_fx_trace, "
             f"got '{mode}'."
         )
+
+    from torchtitan.experiments.graph_trainer.configs import validate_fp8_graph_config
+
+    validate_fp8_graph_config(config.compile)
 
     (
         model,

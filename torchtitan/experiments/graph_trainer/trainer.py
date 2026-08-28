@@ -117,6 +117,13 @@ class GraphTrainer(Trainer):
 
     def __init__(self, config):
         validate_fp8_graph_config(config.compile)
+        # Optional EP+FP8 experiment: mint unbacked MoE pad sizes and soften
+        # aten::_scaled_grouped_mm meta layout guards under FakeTensor.
+        from torchtitan.components.quantization.scaled_grouped_mm_meta_hack import (
+            install_soft_scaled_grouped_mm_meta,
+        )
+
+        install_soft_scaled_grouped_mm_meta()
         super().__init__(config)
 
         validate_memory_policy_config(self.config.compile)
@@ -183,6 +190,9 @@ class GraphTrainer(Trainer):
 
     def _load_precompiled_fx_trace(self, model: nn.Module) -> None:
         """Load a precompiled aot_fx_trace artifact from disk."""
+        from torchtitan.experiments.graph_trainer.configs import (
+            validate_fp8_quantization_precompile,
+        )
         from torchtitan.experiments.graph_trainer.precompile import (
             _FX_TRACE_ARTIFACT_KEY,
             compute_config_fingerprint,
@@ -191,6 +201,7 @@ class GraphTrainer(Trainer):
         from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
 
         compile_config = self.config.compile
+        validate_fp8_quantization_precompile(model, compile_config)
         storage = DiskStorageAdapter(compile_config.precompile_artifact_dir)
 
         if not storage.exists(_FX_TRACE_ARTIFACT_KEY):
