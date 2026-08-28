@@ -35,6 +35,7 @@ try:
 
             pass
 
+
         def __init__(self, config: Config):
             TorchAOMXFP8Linear.__init__(
                 self,
