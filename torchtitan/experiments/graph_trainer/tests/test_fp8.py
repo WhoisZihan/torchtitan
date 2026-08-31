@@ -608,6 +608,158 @@ class TestFP8RegionalAnnotation(TestCase):
         )
 
 
+@unittest.skipUnless(
+    torch.cuda.is_available()
+    and has_cuda_capability(9, 0)
+    and Float8Linear is not None,
+    "FP8 regional compilation requires TorchAO and an H100-class GPU",
+)
+class TestFP8RegionalCompilation(TestCase):
+    def test_float8_grouped_experts_regional_inductor_runs_forward_and_backward(
+        self,
+    ) -> None:
+        torch._inductor.config.emulate_precision_casts = False
+        float8_grouped_experts = _get_float8_grouped_experts_cls(GroupedExperts)
+        model = float8_grouped_experts.Config(
+            dim=16,
+            hidden_dim=16,
+            num_experts=2,
+        ).build()
+        self.assertTrue(torch._inductor.config.emulate_precision_casts)
+        model = model.to(device="cuda", dtype=torch.bfloat16)
+        for parameter in model.parameters():
+            torch.nn.init.normal_(parameter, std=0.02)
+        annotate_module_fqns(nn.Sequential(model))
+        input_tensor = torch.randn(32, 16, device="cuda", dtype=torch.bfloat16)
+        num_tokens_per_expert = torch.tensor(
+            [16, 16], device="cuda", dtype=torch.int64
+        )
+
+        def train_step(
+            x: torch.Tensor, num_tokens: torch.Tensor
+        ) -> list[torch.Tensor]:
+            output = model(x, num_tokens)
+            loss = output.float().sum()
+            grads = torch.autograd.grad(loss, tuple(model.parameters()))
+            return [loss, *grads]
+
+        expected = train_step(input_tensor, num_tokens_per_expert)
+        traced = minimal_fx_tracer(train_step, module=model)(
+            input_tensor, num_tokens_per_expert
+        )
+        self.assertTrue(
+            any(
+                node.target in FP8_COMPUTE_TARGETS["float8_grouped_experts"]
+                for node in traced.gm.graph.nodes
+            )
+        )
+
+        annotate_fp8_regions_for_regional_inductor_pass(traced.gm, strict=True)
+        annotate_complete_fp8_regions_for_regional_inductor_pass(traced.gm)
+        traced.gm = regional_inductor_pass(traced.gm, traced.example_inputs)
+        actual = run_traced(traced, module=model)(
+            input_tensor, num_tokens_per_expert
+        )
+
+        self.assertEqual(len(actual), len(expected))
+        for output_index, (actual_tensor, expected_tensor) in enumerate(
+            zip(actual, expected, strict=True)
+        ):
+            with self.subTest(output_index=output_index):
+                torch.testing.assert_close(actual_tensor, expected_tensor)
+
+    def test_float8_linear_converter_regional_inductor_runs_forward_and_backward(
+        self,
+    ) -> None:
+        converter = Float8LinearConverter(
+            Float8LinearConverter.Config(model_compile_enabled=True)
+        )
+        linear_config = converter.convert(
+            Linear.Config(in_features=16, out_features=16, bias=False)
+        )
+        self.assertIsInstance(linear_config, Float8Linear.Config)
+        model = nn.Sequential(linear_config.build()).to(
+            device="cuda", dtype=torch.bfloat16
+        )
+        annotate_module_fqns(model)
+        input_tensor = torch.randn(16, 16, device="cuda", dtype=torch.bfloat16)
+
+        def train_step(x: torch.Tensor) -> list[torch.Tensor]:
+            output = model(x)
+            loss = output.float().sum()
+            grads = torch.autograd.grad(loss, tuple(model.parameters()))
+            return [loss, *grads]
+
+        expected = train_step(input_tensor)
+        traced = minimal_fx_tracer(train_step, module=model)(input_tensor)
+        self.assertTrue(
+            any(
+                node.target in FP8_COMPUTE_TARGETS["float8_linear"]
+                for node in traced.gm.graph.nodes
+            )
+        )
+
+        annotate_fp8_regions_for_regional_inductor_pass(traced.gm, strict=True)
+        annotate_complete_fp8_regions_for_regional_inductor_pass(traced.gm)
+        traced.gm = regional_inductor_pass(traced.gm, traced.example_inputs)
+        actual = run_traced(traced, module=model)(input_tensor)
+
+        self.assertEqual(len(actual), len(expected))
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+            torch.testing.assert_close(actual_tensor, expected_tensor)
+
+    def test_float8_regional_inductor_cudagraph_replays_dynamic_inputs_and_state(
+        self,
+    ) -> None:
+        converter = Float8LinearConverter(
+            Float8LinearConverter.Config(model_compile_enabled=True)
+        )
+        linear_config = converter.convert(
+            Linear.Config(in_features=16, out_features=16, bias=False)
+        )
+        model = nn.Sequential(linear_config.build()).to(
+            device="cuda", dtype=torch.bfloat16
+        )
+        annotate_module_fqns(model)
+
+        def train_step(x: torch.Tensor) -> list[torch.Tensor]:
+            output = model(x)
+            loss = output.float().square().mean()
+            grads = torch.autograd.grad(loss, tuple(model.parameters()))
+            return [loss, *grads]
+
+        inputs = [
+            torch.randn(16, 16, device="cuda", dtype=torch.bfloat16)
+            for _ in range(3)
+        ]
+        traced = minimal_fx_tracer(train_step, module=model)(inputs[0])
+        annotate_fp8_regions_for_regional_inductor_pass(traced.gm, strict=True)
+        annotate_complete_fp8_regions_for_regional_inductor_pass(traced.gm)
+        traced.gm = regional_inductor_pass(traced.gm, traced.example_inputs)
+        traced.gm = cudagraph_pass(
+            traced.gm,
+            traced.example_inputs,
+            static_input_indices=tuple(range(traced.num_static_inputs)),
+            tensor_input_indices=traced.tensor_input_indices,
+        )
+        self.assertIsInstance(traced.gm.forward, CUDAGraphWrapper)
+        compiled_step = run_traced(traced, module=model)
+
+        # Call 1 warms up, call 2 captures, and call 3 replays with both new
+        # activation values and updated parameter contents at stable addresses.
+        for index, input_tensor in enumerate(inputs):
+            expected = train_step(input_tensor)
+            actual = compiled_step(input_tensor)
+            self.assertEqual(len(actual), len(expected))
+            for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+                torch.testing.assert_close(actual_tensor, expected_tensor)
+            if index == 1:
+                with torch.no_grad():
+                    for parameter in model.parameters():
+                        parameter.add_(0.125)
+        self.assertIsNotNone(traced.gm.forward._cudagraph)
+
+
 class TestFP8PassOrdering(TestCase):
     def test_full_inductor_precedes_cudagraph(self) -> None:
         config = SimpleNamespace(

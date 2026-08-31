@@ -119,10 +119,8 @@ class Float8LinearConverter(QuantizationConverter):
             self.torchao_config = TorchAOFloat8LinearConfig(emulate=True)
         logger.info(f"Float8 training active with recipe {cfg.recipe_name}")
 
-        # short-term solution for https://github.com/pytorch/pytorch/issues/150859
         if cfg.recipe_name == "rowwise":
-            torch._inductor.config.emulate_precision_casts = True
-            logger.debug("Set torch._inductor.config.emulate_precision_casts to True")
+            _enable_rowwise_inductor_eager_numerics()
 
         # Build filter function
         clean_fqns = [f for f in filter_fqns if f != "auto_filter_small_kn"]
@@ -179,6 +177,12 @@ class Float8LinearConverter(QuantizationConverter):
 _float8_experts_cache: dict[type, type] = {}
 
 
+def _enable_rowwise_inductor_eager_numerics() -> None:
+    # Short-term solution for https://github.com/pytorch/pytorch/issues/150859.
+    torch._inductor.config.emulate_precision_casts = True
+    logger.debug("Set torch._inductor.config.emulate_precision_casts to True")
+
+
 def _get_float8_grouped_experts_cls(parent_cls: type) -> type:
     """Get or create a Float8-quantized subclass of *parent_cls*.
 
@@ -199,7 +203,10 @@ def _get_float8_grouped_experts_cls(parent_cls: type) -> type:
             super().__init__(config)
             from torchao.prototype.moe_training.config import Float8TrainingOpConfig
 
+            _enable_rowwise_inductor_eager_numerics()
             self._float8_op_config = Float8TrainingOpConfig()
+            self._quantization_emulate = False
+            self._torchtitan_quantization_pad_multiple = 16
 
         def _grouped_mm(self, *, A, B_t, offs):
             from torchao.prototype.moe_training.utils import (
